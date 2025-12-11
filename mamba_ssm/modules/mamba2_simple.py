@@ -1,3 +1,4 @@
+# mamba_ssm/modules/mamba2_simple.py
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 
 import math
@@ -8,14 +9,19 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 try:
-    from causal_conv1d import causal_conv1d_fn
+    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 except ImportError:
-    causal_conv1d_fn = None
+    causal_conv1d_fn, causal_conv1d_update = None, None
 
 try:
     from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated, LayerNorm
 except ImportError:
     RMSNormGated, LayerNorm = None, None
+
+try:
+    from mamba_ssm.ops.triton.selective_state_update import selective_state_update
+except ImportError:
+    selective_state_update = None
 
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
@@ -25,11 +31,11 @@ class Mamba2Simple(nn.Module):
     def __init__(
         self,
         d_model,
-        d_state=64,
+        d_state=128,
         d_conv=4,
         conv_init=None,
         expand=2,
-        headdim=128,
+        headdim=64,
         ngroups=1,
         A_init_range=(1, 16),
         dt_min=0.001,
@@ -46,6 +52,7 @@ class Mamba2Simple(nn.Module):
         layer_idx=None,  # Absorb kwarg for general module
         device=None,
         dtype=None,
+        **kwargs,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -121,19 +128,27 @@ class Mamba2Simple(nn.Module):
 
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
 
-    def forward(self, u, seq_idx=None):
+    def forward(self, u, seq_idx=None, inference_params=None):
         """
         u: (B, L, D)
         Returns: same shape as u
         """
         batch, seqlen, dim = u.shape
 
+        conv_state, ssm_state = None, None
+        if inference_params is not None:
+            conv_state, ssm_state = self._get_states_from_cache(inference_params, batch)
+            if inference_params.seqlen_offset > 0:
+                # The states are updated inplace
+                out, _, _ = self.step(u, conv_state, ssm_state)
+                return out
+
         zxbcdt = self.in_proj(u)  # (B, L, d_in_proj)
         A = -torch.exp(self.A_log)  # (nheads) or (d_inner, d_state)
         initial_states=repeat(self.init_states, "... -> b ...", b=batch) if self.learnable_init_states else None
         dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
 
-        if self.use_mem_eff_path:
+        if self.use_mem_eff_path and inference_params is None:
             # Fully fused path
             out = mamba_split_conv1d_scan_combined(
                 zxbcdt,
@@ -161,6 +176,12 @@ class Mamba2Simple(nn.Module):
             )
             dt = F.softplus(dt + self.dt_bias)  # (B, L, nheads)
             assert self.activation in ["silu", "swish"]
+
+            if conv_state is not None:
+                # If we just take xBC[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
+                # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
+                xBC_t = rearrange(xBC, "b l d -> b d l")
+                conv_state.copy_(F.pad(xBC_t, (self.d_conv - xBC_t.shape[-1], 0)))  # Update state (B D W)
 
             # 1D Convolution
             if causal_conv1d_fn is None or self.activation not in ["silu", "swish"]:
@@ -198,3 +219,101 @@ class Mamba2Simple(nn.Module):
             y = self.norm(y, z)
             out = self.out_proj(y)
         return out
+
+    def step(self, hidden_states, conv_state, ssm_state):
+        dtype = hidden_states.dtype
+        assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
+        zxbcdt = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
+        z, xBC, dt = torch.split(
+            zxbcdt,
+            [self.d_inner, self.d_inner + 2 * self.ngroups * self.d_state, self.nheads],
+            dim=-1
+        )
+
+        # Conv step
+        if causal_conv1d_update is None:
+            conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
+            conv_state[:, :, -1] = xBC
+            xBC = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)  # (B D)
+            if self.conv1d.bias is not None:
+                xBC = xBC + self.conv1d.bias
+            xBC = self.act(xBC).to(dtype=dtype)
+        else:
+            xBC = causal_conv1d_update(
+                xBC,
+                conv_state,
+                rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                self.conv1d.bias,
+                self.activation,
+            )
+
+        x, B, C = torch.split(xBC, [self.d_inner, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
+        A = -torch.exp(self.A_log.float())  # (nheads,)
+
+        # SSM step
+        if selective_state_update is None:
+            # Discretize A and B
+            dt = F.softplus(dt + self.dt_bias.to(dtype=dt.dtype))  # (batch, nheads)
+            dA = torch.exp(dt * A)  # (batch, nheads)
+            x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
+            dBx = torch.einsum("bh,bn,bhp->bhpn", dt, B, x)
+            ssm_state.copy_(ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
+            y = torch.einsum("bhpn,bn->bhp", ssm_state.to(dtype), C)
+            y = y + rearrange(self.D.to(dtype), "h -> h 1") * x
+            y = rearrange(y, "b h p -> b (h p)")
+        else:
+            A = repeat(A, "h -> h p n", p=self.headdim, n=self.d_state).to(dtype=torch.float32)
+            dt = repeat(dt, "b h -> b h p", p=self.headdim)
+            dt_bias = repeat(self.dt_bias, "h -> h p", p=self.headdim)
+            D = repeat(self.D, "h -> h p", p=self.headdim)
+            B = rearrange(B, "b (g n) -> b g n", g=self.ngroups)
+            C = rearrange(C, "b (g n) -> b g n", g=self.ngroups)
+            x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.headdim)
+            y = selective_state_update(
+                ssm_state, x_reshaped, dt, A, B, C, D, z=None,
+                dt_bias=dt_bias, dt_softplus=True
+            )
+            y = rearrange(y, "b h p -> b (h p)")
+        
+        y = self.norm(y, z)
+        out = self.out_proj(y)
+        return out.unsqueeze(1), conv_state, ssm_state
+
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+        device = self.out_proj.weight.device
+        conv_dtype = self.conv1d.weight.dtype if dtype is None else dtype
+        conv_state = torch.zeros(
+            batch_size, self.d_conv, self.conv1d.weight.shape[0], device=device, dtype=conv_dtype
+        ).transpose(1, 2)
+        ssm_dtype = self.in_proj.weight.dtype if dtype is None else dtype
+        ssm_state = torch.zeros(
+            batch_size, self.nheads, self.headdim, self.d_state, device=device, dtype=ssm_dtype
+        )
+        return conv_state, ssm_state
+
+    def _get_states_from_cache(self, inference_params, batch_size, initialize_states=False):
+        assert self.layer_idx is not None
+        if self.layer_idx not in inference_params.key_value_memory_dict:
+            batch_shape = (batch_size,)
+            conv_state = torch.zeros(
+                batch_size,
+                self.d_conv,
+                self.conv1d.weight.shape[0],
+                device=self.conv1d.weight.device,
+                dtype=self.conv1d.weight.dtype,
+            ).transpose(1, 2)
+            ssm_state = torch.zeros(
+                batch_size,
+                self.nheads,
+                self.headdim,
+                self.d_state,
+                device=self.in_proj.weight.device,
+                dtype=self.in_proj.weight.dtype,
+            )
+            inference_params.key_value_memory_dict[self.layer_idx] = (conv_state, ssm_state)
+        else:
+            conv_state, ssm_state = inference_params.key_value_memory_dict[self.layer_idx]
+            if initialize_states:
+                conv_state.zero_()
+                ssm_state.zero_()
+        return conv_state, ssm_state

@@ -10,5 +10,5 @@ docker run --gpus '"device=0"' \
     --pull=always \
     --rm -it \
     --shm-size=16g \
-    -v "${PROJECT_ROOT}/benchmarks:/app/benchmarks" \
+    -v "${PROJECT_ROOT}:/app" \
     aimilefth/mamba-a2
